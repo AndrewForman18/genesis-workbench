@@ -1,0 +1,72 @@
+resources:
+  jobs:
+    fetchngs:
+      name: run_fetchngs_gwb
+
+      email_notifications:
+        on_failure:
+          - ${var.current_user}
+
+      tasks:
+        - task_key: run_fetchngs
+          notebook_task:
+            notebook_path: ../notebooks/nextflow_sandwich_wrapper_fetchngs.ipynb
+            source: WORKSPACE
+          new_cluster:
+            # Single-node, memory-optimized for Nextflow + fasterq-dump
+            # r5.4xlarge: 16 vCPU, 128 GB RAM — handles large studies (>100 samples, >500 GB)
+            # No workers needed: Nextflow manages its own task parallelism
+            spark_version: 16.4.x-scala2.12
+            node_type_id: r5.4xlarge
+            num_workers: 0
+            spark_conf:
+              spark.master: "local[*]"
+              spark.databricks.cluster.profile: singleNode
+              spark.driver.memory: 88g
+            custom_tags:
+              ResourceClass: SingleNode
+              application: genesis_workbench
+              module: fetchngs
+            init_scripts:
+              - volumes:
+                  destination: /Volumes/dhbl_discovery_us_dev/genesis_schema/scanpy_reference/init_scripts/install_nextflow.sh
+            data_security_mode: SINGLE_USER
+            enable_elastic_disk: true
+            # r5 instances are EBS-only — must attach explicit volumes
+            # ON_DEMAND: fetchngs downloads are long-running (30-60 min)
+            # and cannot tolerate spot interruption mid-transfer
+            aws_attributes:
+              availability: ON_DEMAND
+              ebs_volume_type: GENERAL_PURPOSE_SSD
+              ebs_volume_count: 1
+              ebs_volume_size: 200
+
+      parameters:
+        - name: accession_ids
+          default: ""
+        - name: output_dir
+          default: ""
+        - name: pipeline_version
+          default: "1.12.0"
+        - name: nf_core_pipeline
+          default: scrnaseq
+        - name: download_method
+          default: sratools
+        - name: genome
+          default: GRCh38
+        - name: extra_args
+          default: ""
+        - name: qc_gate_enabled
+          default: "true"
+        - name: min_fastq_size_mb
+          default: "10"
+        - name: trigger_downstream
+          default: "false"
+        - name: project_name
+          default: ""
+        - name: catalog
+          default: ${var.core_catalog_name}
+        - name: schema
+          default: ${var.core_schema_name}
+
+      tags: ${var.common_resource_tags}

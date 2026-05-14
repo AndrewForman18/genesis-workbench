@@ -1,0 +1,104 @@
+resources:
+  jobs:
+    vep_annovar_annotation_job:
+      name: variant_annotation_vep_annovar
+      tags:
+        application: genesis_workbench
+        module: variant_annotation_v2
+      max_concurrent_runs: 1
+      email_notifications:
+        on_failure:
+          - ${var.current_user}
+      job_clusters:
+        - job_cluster_key: vep_annovar_cluster
+          new_cluster:
+            spark_version: "16.4.x-scala2.12"
+            node_type_id: i3.4xlarge
+            num_workers: 0
+            data_security_mode: SINGLE_USER
+            spark_conf:
+              spark.master: "local[*]"
+      tasks:
+        - task_key: run_vep_annovar
+          job_cluster_key: vep_annovar_cluster
+          notebook_task:
+            notebook_path: ../notebooks/01_vep_annovar_annotation
+            source: WORKSPACE
+            base_parameters:
+              catalog: ${var.core_catalog_name}
+              schema: ${var.core_schema_name}
+              sql_warehouse_id: ${var.sql_warehouse_id}
+              vcf_path: ""
+              reference_volume: "/Volumes/${var.core_catalog_name}/${var.core_schema_name}/variant_annotation_reference"
+              genome_build: "GRCh38"
+              annotation_tools: "both"
+              vep_extra_flags: ""
+              annovar_protocols: "refGene,gnomad40_genome,clinvar_20240917,dbnsfp42a,cosmic70"
+              annovar_operations: "g,f,f,f,f"
+              mlflow_run_id: ""
+              run_name: ""
+              user_email: ""
+        - task_key: mark_success
+          depends_on:
+            - task_key: run_vep_annovar
+          run_if: ALL_SUCCESS
+          job_cluster_key: vep_annovar_cluster
+          notebook_task:
+            notebook_path: ../../variant_annotation_v1/notebooks/update_mlflow_status
+            source: WORKSPACE
+            base_parameters:
+              mlflow_run_id: ""
+              job_status: "annotation_v2_complete"
+              catalog: ${var.core_catalog_name}
+              schema: ${var.core_schema_name}
+              sql_warehouse_id: ${var.sql_warehouse_id}
+        - task_key: mark_failure
+          depends_on:
+            - task_key: run_vep_annovar
+          run_if: AT_LEAST_ONE_FAILED
+          job_cluster_key: vep_annovar_cluster
+          notebook_task:
+            notebook_path: ../../variant_annotation_v1/notebooks/update_mlflow_status
+            source: WORKSPACE
+            base_parameters:
+              mlflow_run_id: ""
+              job_status: "failed"
+              catalog: ${var.core_catalog_name}
+              schema: ${var.core_schema_name}
+              sql_warehouse_id: ${var.sql_warehouse_id}
+
+    vep_annovar_setup_job:
+      name: variant_annotation_v2_setup
+      tags:
+        application: genesis_workbench
+        module: variant_annotation_v2
+      max_concurrent_runs: 1
+      email_notifications:
+        on_success:
+          - ${var.current_user}
+        on_failure:
+          - ${var.current_user}
+      job_clusters:
+        - job_cluster_key: vep_annovar_setup_cluster
+          new_cluster:
+            spark_version: "16.4.x-scala2.12"
+            node_type_id: i3.4xlarge
+            num_workers: 0
+            data_security_mode: SINGLE_USER
+            spark_conf:
+              spark.master: "local[*]"
+      tasks:
+        - task_key: setup_databases
+          job_cluster_key: vep_annovar_setup_cluster
+          timeout_seconds: 10800
+          notebook_task:
+            notebook_path: ../notebooks/00_setup_reference_databases
+            source: WORKSPACE
+            base_parameters:
+              reference_volume: "/Volumes/${var.core_catalog_name}/${var.core_schema_name}/variant_annotation_reference"
+              genome_build: "GRCh38"
+              install_components: "all"
+              annovar_download_url: ""
+              annovar_protocols: "refGene,gnomad40_genome,clinvar_20240917,dbnsfp42a,cosmic70"
+              annovar_operations: "g,f,f,f,f"
+              install_cadd_plugin: "no"

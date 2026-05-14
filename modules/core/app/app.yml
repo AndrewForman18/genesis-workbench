@@ -13,11 +13,18 @@ env:
     valueFrom: "core_catalog_name"
   - name: CORE_SCHEMA_NAME
     valueFrom: "core_schema_name"
-  - name: LLM_ENDPOINT_NAME
-    valueFrom: "llm_endpoint"
-
-    
-
-
-
+  - name: VARIANT_ANNOTATION_V2_JOB_ID
+    value: "633979331375413"
+  - name: VARIANT_ANNOTATION_V2_SETUP_JOB_ID
+    value: "930917968034893"
+  - name: BIONEMO_ESM_FINETUNE_JOB_ID
+    value: "157594759891314"
+  - name: BIONEMO_ESM_INFERENCE_JOB_ID
+    value: "863025693548501"
+  - name: GENEFORMER_REGISTER_JOB_ID
+    value: "1006069508369614"
+  - name: SAREK_VARIANT_CALLING_JOB_ID
+    value: "64553839697857"
+  - name: ISOSEQ_ISOFORM_SEQUENCING_JOB_ID
+    value: "746656389496912"
 

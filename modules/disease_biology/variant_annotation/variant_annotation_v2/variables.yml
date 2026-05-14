@@ -1,0 +1,36 @@
+variables:
+  current_user:
+    description: User deploying the bundle
+    default: ${workspace.current_user.userName}
+  current_working_directory:
+    description: Working directory or bundle root.
+    default: /Users/${var.current_user}/.bundle/${bundle.name}/${bundle.target}
+  workspace_url:
+    description: Workspace url for deployment
+  common_resource_tags:
+    description: Resource tags
+    default:
+      application: genesis_workbench
+      module: variant_annotation_v2
+      created_by: ${workspace.current_user.short_name}
+  cpu_node_type:
+    description: Node type for CPU vms
+  core_catalog_name:
+    description: primary catalog
+  core_schema_name:
+    description: The schema for this module
+  sql_warehouse_id:
+    description: SQL Warehouse ID
+  t4_node_type:
+    description: Node type for T4 GPUs
+  a10_node_type:
+    description: Node type for A10 GPUs
+  gpu_small_setting:
+    description: GPU small config setting
+  gpu_medium_setting:
+    description: GPU medium config setting
+  gpu_large_setting:
+    description: GPU large config setting
+  module_registration_experiment_name:
+    description: MLflow experiment name
+    default: dbx_genesis_workbench_modules

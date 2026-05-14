@@ -1,0 +1,104 @@
+#!/bin/bash
+# Databricks Container Services compatibility init script
+# Installs JDK 8, iproute2, R, Python virtualenv BEFORE Spark/JVM starts.
+# Used with NGC images that don't include Databricks requirements.
+set -x  # Print commands for debugging (no -e to avoid failing on non-critical errors)
+
+echo "[init] Installing Databricks Container Services requirements..."
+
+# Install core system packages (JDK 8 is critical for Spark)
+apt-get update -qq
+apt-get install --yes --no-install-recommends \
+  iproute2 \
+  bash \
+  sudo \
+  coreutils \
+  procps \
+  acl \
+  wget \
+  software-properties-common \
+  apt-transport-https \
+  libssl-dev || echo "[init] WARN: Some base packages failed"
+
+# Install JDK - try OpenJDK 8 first, fall back to 11
+if apt-get install --yes --no-install-recommends openjdk-8-jdk 2>/dev/null; then
+  echo "[init] Installed OpenJDK 8"
+  export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
+elif apt-get install --yes --no-install-recommends openjdk-11-jdk 2>/dev/null; then
+  echo "[init] Installed OpenJDK 11 (fallback)"
+  export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
+else
+  echo "[init] ERROR: Could not install JDK!"
+  exit 1
+fi
+echo "export JAVA_HOME=${JAVA_HOME}" >> /etc/environment
+
+# Configure Java certificates
+/var/lib/dpkg/info/ca-certificates-java.postinst configure 2>/dev/null || true
+
+# Install R (required for Databricks driver setup) - non-critical, suppress errors
+export DEBIAN_FRONTEND=noninteractive
+apt-get install --yes --no-install-recommends r-base r-base-dev 2>/dev/null || \
+  echo "[init] WARN: R installation failed (non-critical)"
+
+# Create libraries user (required by Databricks)
+useradd libraries 2>/dev/null || true
+usermod -L libraries 2>/dev/null || true
+
+# Find the right Python binary in the NGC image
+PYTHON_BIN=""
+if command -v python3 &>/dev/null; then
+  PYTHON_BIN="python3"
+elif command -v python &>/dev/null; then
+  PYTHON_BIN="python"
+elif [ -f /opt/conda/bin/python3 ]; then
+  PYTHON_BIN="/opt/conda/bin/python3"
+else
+  echo "[init] ERROR: No Python found!"
+  exit 1
+fi
+echo "[init] Using Python: $PYTHON_BIN ($($PYTHON_BIN --version))"
+
+# Ensure pip and venv modules are available
+$PYTHON_BIN -m ensurepip --upgrade 2>/dev/null || true
+$PYTHON_BIN -m pip install --quiet --upgrade pip virtualenv 2>/dev/null || true
+
+# Create /databricks/python3 virtualenv if it doesn't exist
+mkdir -p /databricks
+if [ ! -f /databricks/python3/bin/python3 ]; then
+  $PYTHON_BIN -m venv /databricks/python3 || \
+    $PYTHON_BIN -m virtualenv /databricks/python3 || {
+      echo "[init] ERROR: Could not create virtualenv!"
+      exit 1
+    }
+fi
+
+# Install core Databricks Python packages (split into critical vs optional)
+/databricks/python3/bin/pip install --quiet --no-cache-dir \
+  six ipython ipykernel numpy pandas "pyarrow>=14.0" protobuf \
+  databricks-sdk virtualenv mlflow pyyaml urllib3 requests certifi 2>&1 || echo "[init] WARN: Some pip packages failed"
+
+# Optional packages (non-critical)
+/databricks/python3/bin/pip install --quiet --no-cache-dir \
+  jedi ipython-genutils matplotlib Jinja2 grpcio grpcio-status 2>/dev/null || true
+
+# Set PYSPARK_PYTHON
+export PYSPARK_PYTHON=/databricks/python3/bin/python3
+echo "export PYSPARK_PYTHON=/databricks/python3/bin/python3" >> /etc/environment
+echo "PYSPARK_PYTHON=/databricks/python3/bin/python3" >> /etc/environment
+
+# Create Python LSP venv for notebook autocomplete (non-critical)
+if [ ! -f /databricks/python-lsp/bin/python3 ]; then
+  $PYTHON_BIN -m venv /databricks/python-lsp 2>/dev/null || true
+fi
+if [ -f /databricks/python-lsp/bin/pip ]; then
+  /databricks/python-lsp/bin/pip install --quiet --no-cache-dir \
+    python-lsp-server 2>/dev/null || true
+fi
+
+# Cleanup to save disk
+apt-get clean 2>/dev/null || true
+rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* 2>/dev/null || true
+
+echo "[init] Databricks DCS requirements installed successfully"
+exit 0

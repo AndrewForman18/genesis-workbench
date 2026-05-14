@@ -7,7 +7,8 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install numpy==1.26.4 scanpy==1.11.4 anndata==0.12.10 scikit-network
+# DBTITLE 1,Install dependencies
+# MAGIC %pip install 'numpy<2' scanpy==1.11.4 anndata scikit-network scrublet harmonypy leidenalg scimilarity celltypist
 # MAGIC %restart_python
 
 # COMMAND ----------
@@ -22,6 +23,7 @@ import time
 
 # COMMAND ----------
 
+# DBTITLE 1,Pipeline widgets
 dbutils.widgets.text("data_path", "", "Data Path")
 dbutils.widgets.text("user_email", "", "User Email")
 dbutils.widgets.text("mlflow_experiment", "", "MLflow Experiment")
@@ -38,10 +40,21 @@ dbutils.widgets.text("target_sum", "10000", "Target Sum for Normalization")
 dbutils.widgets.text("n_top_genes", "500", "Number of Highly Variable Genes")
 dbutils.widgets.text("n_pcs", "50", "Number of Principal Components")
 dbutils.widgets.text("cluster_resolution", "0.2", "Cluster Resolution")
-dbutils.widgets.text("compute_pseudotime", "false", "Compute Pseudotime (true/false)")
+
+# CellExpress/Cellatria integration — doublet detection, batch correction, clustering
+dbutils.widgets.dropdown("doublet_method", "scrublet", ["none", "scrublet"], "Doublet Detection Method")
+dbutils.widgets.text("scrublet_threshold", "0.25", "Scrublet Score Threshold")
+dbutils.widgets.dropdown("batch_correction", "none", ["none", "harmony"], "Batch Correction Method")
+dbutils.widgets.text("batch_key", "", "Batch Key Column (for batch correction)")
+dbutils.widgets.dropdown("clustering_method", "leiden", ["leiden", "louvain"], "Clustering Method")
+
+# Cell type annotation (SCimilarity/CellTypist from Cellatria)
+dbutils.widgets.dropdown("annotation_method", "none", ["none", "scimilarity", "celltypist"], "Cell Type Annotation Method")
+dbutils.widgets.text("annotation_model", "", "Annotation Model (path or name)")
 
 # COMMAND ----------
 
+# DBTITLE 1,Parameters
 parameters = {
   'data_path':dbutils.widgets.get("data_path"),
   'user_email':dbutils.widgets.get("user_email"),
@@ -59,7 +72,15 @@ parameters = {
   'n_top_genes': int(dbutils.widgets.get("n_top_genes")),
   'n_pcs': int(dbutils.widgets.get("n_pcs")),
   'cluster_resolution': float(dbutils.widgets.get("cluster_resolution")),
-  'compute_pseudotime': dbutils.widgets.get("compute_pseudotime").lower() == "true",
+  # CellExpress/Cellatria integration parameters
+  'doublet_method': dbutils.widgets.get("doublet_method"),
+  'scrublet_threshold': float(dbutils.widgets.get("scrublet_threshold")),
+  'batch_correction': dbutils.widgets.get("batch_correction"),
+  'batch_key': dbutils.widgets.get("batch_key"),
+  'clustering_method': dbutils.widgets.get("clustering_method"),
+  # Cell type annotation parameters
+  'annotation_method': dbutils.widgets.get("annotation_method"),
+  'annotation_model': dbutils.widgets.get("annotation_model"),
 }
 
 metrics = {}
@@ -213,6 +234,47 @@ adata = adata[adata.obs.pct_counts_mt < parameters['pct_counts_mt'], :].copy() #
 
 # COMMAND ----------
 
+# DBTITLE 1,Doublet Detection (Scrublet)
+# MAGIC %md
+# MAGIC #### Doublet Detection (Scrublet)
+
+# COMMAND ----------
+
+# DBTITLE 1,Scrublet doublet detection
+# Scrublet doublet detection — integrated from CellAtria/CellExpress pipeline
+if parameters['doublet_method'] == 'scrublet':
+    import scrublet as scr
+    
+    scrub = scr.Scrublet(adata.X)
+    doublet_scores, predicted_doublets = scrub.scrub_doublets(min_counts=2, min_cells=3, min_gene_variability_pctl=85)
+    
+    adata.obs['doublet_score'] = doublet_scores
+    adata.obs['predicted_doublet'] = predicted_doublets
+    
+    # Apply threshold from parameters
+    threshold = parameters['scrublet_threshold']
+    adata.obs['is_doublet'] = adata.obs['doublet_score'] > threshold
+    
+    n_doublets = adata.obs['is_doublet'].sum()
+    n_total = adata.shape[0]
+    print(f"Scrublet detected {n_doublets} doublets ({100*n_doublets/n_total:.1f}%) at threshold {threshold}")
+    
+    metrics['n_doublets_detected'] = int(n_doublets)
+    metrics['doublet_rate'] = float(n_doublets / n_total)
+    
+    # Remove doublets
+    adata = adata[~adata.obs['is_doublet']].copy()
+    print(f"Retained {adata.shape[0]} singlets after doublet removal")
+    
+    metrics['filter_doublet_retention'] = 100.0 * adata.shape[0] / current_cells
+    current_cells = adata.shape[0]
+else:
+    print("Doublet detection: skipped (method=none)")
+    metrics['n_doublets_detected'] = 0
+    metrics['doublet_rate'] = 0.0
+
+# COMMAND ----------
+
 metrics['filter_mtgenes_retention'] =  100.0*adata.shape[0]/current_cells
 current_cells = adata.shape[0]
 
@@ -266,6 +328,51 @@ for i in range(4): #adata._obsm['X_pca'].shape[1]):
 
 # COMMAND ----------
 
+# DBTITLE 1,Batch Correction (Harmony)
+# MAGIC %md
+# MAGIC #### Batch Correction (Harmony)
+
+# COMMAND ----------
+
+# DBTITLE 1,Harmony batch correction
+# Harmony batch correction — integrated from CellAtria/CellExpress pipeline
+if parameters['batch_correction'] == 'harmony':
+    batch_key = parameters['batch_key'].strip()
+    
+    if not batch_key:
+        print("⚠️ Batch correction requested but no batch_key provided. Skipping.")
+    elif batch_key not in adata.obs.columns:
+        print(f"⚠️ Batch key '{batch_key}' not found in adata.obs columns: {list(adata.obs.columns)[:10]}... Skipping.")
+    else:
+        import harmonypy
+        
+        n_batches = adata.obs[batch_key].nunique()
+        print(f"Running Harmony batch correction on '{batch_key}' ({n_batches} batches)...")
+        
+        # Store uncorrected PCA for comparison
+        adata.obsm['X_pca_uncorrected'] = adata.obsm['X_pca'].copy()
+        
+        # Run Harmony
+        harmony_out = harmonypy.run_harmony(
+            adata.obsm['X_pca'],
+            adata.obs,
+            batch_key,
+            max_iter_harmony=20
+        )
+        
+        # Replace PCA embeddings with Harmony-corrected ones
+        adata.obsm['X_pca_harmony'] = harmony_out.Z_corr.T
+        adata.obsm['X_pca'] = adata.obsm['X_pca_harmony']
+        
+        metrics['batch_correction'] = 'harmony'
+        metrics['n_batches'] = int(n_batches)
+        print(f"Harmony correction complete. PCA embeddings updated.")
+else:
+    print("Batch correction: skipped (method=none)")
+    metrics['batch_correction'] = 'none'
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC #### Do UMAP
 
@@ -275,42 +382,44 @@ sc.pp.neighbors(adata)
 
 # COMMAND ----------
 
-# We use scikit-network Louvain instead of scanpy's Leiden to avoid igraph dependency.
-# Alternative: use scanpy's leiden directly if igraph is acceptable:
-# sc.tl.leiden(
-#     adata,
-#     resolution=parameters['cluster_resolution'],
-#     n_iterations=10,
-#     flavor='leidenalg',  # requires leidenalg package, or 'igraph' (requires python-igraph)
-# )
-# adata.obs['cluster'] = adata.obs['leiden']  # rename for consistency
+# DBTITLE 1,Clustering (Leiden or Louvain)
+# MAGIC %md
+# MAGIC #### Clustering (Leiden or Louvain)
 
 # COMMAND ----------
 
-from sknetwork.clustering import Louvain
+# DBTITLE 1,Dual-method clustering
+# Clustering — supports both Leiden (from CellExpress/Cellatria) and Louvain (original GWB)
+if parameters['clustering_method'] == 'leiden':
+    # Leiden clustering (recommended — used by CellExpress pipeline)
+    sc.tl.leiden(
+        adata,
+        resolution=parameters['cluster_resolution'],
+        n_iterations=10,
+        flavor='leidenalg',
+    )
+    adata.obs['cluster'] = adata.obs['leiden']
+    method_name = "Leiden"
+else:
+    # Louvain clustering (original GWB method via scikit-network)
+    from sknetwork.clustering import Louvain
+    louvain = Louvain(
+        resolution=parameters['cluster_resolution'],
+        modularity="dugue",
+        shuffle_nodes=True,
+        sort_clusters=True,
+        random_state=0,
+        verbose=False
+    )
+    adjacency = adata.obsp['connectivities']
+    labels = louvain.fit_predict(adjacency)
+    adata.obs['cluster'] = pd.Categorical(labels.astype(str))
+    method_name = "Louvain"
 
-# Initialize Louvain clustering
-louvain = Louvain(
-    resolution=parameters['cluster_resolution'],
-    modularity="dugue",
-    shuffle_nodes=True,
-    sort_clusters=True,
-    return_probs=False,
-    return_aggregate=False,
-    random_state=0,      
-    verbose=False
-)
-
-# Get the adjacency matrix from scanpy's neighbors graph
-adjacency = adata.obsp['connectivities']
-
-# Run Louvain clustering
-labels = louvain.fit_predict(adjacency)
-
-# Store results in adata.obs as 'cluster'
-adata.obs['cluster'] = pd.Categorical(labels.astype(str))
-
-print(f"Louvain clustering complete. Found {len(adata.obs['cluster'].unique())} clusters.")
+n_clusters = len(adata.obs['cluster'].unique())
+print(f"{method_name} clustering complete. Found {n_clusters} clusters at resolution {parameters['cluster_resolution']}.")
+metrics['clustering_method'] = method_name.lower()
+metrics['n_clusters'] = int(n_clusters)
 
 # COMMAND ----------
 
@@ -330,20 +439,173 @@ sc.pl.umap(
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ### Diffusion Pseudotime (optional)
+# DBTITLE 1,UMAP doublet score visualization
+# Visualize doublet scores on UMAP (if Scrublet was run)
+if parameters['doublet_method'] == 'scrublet' and 'doublet_score' in adata.obs.columns:
+    # Note: doublets already removed, but scores of retained cells show distribution
+    sc.pl.umap(adata, color="doublet_score", size=2, save='umap_doublet_scores.png')
 
 # COMMAND ----------
 
-if parameters.get('compute_pseudotime', False):
-    import numpy as np
-    print("Computing diffusion pseudotime...")
-    adata.uns['iroot'] = int(np.flatnonzero(adata.obs['cluster'] == '0')[0])
-    sc.tl.diffmap(adata)
-    sc.tl.dpt(adata)
-    print(f"Pseudotime range: {adata.obs['dpt_pseudotime'].min():.3f} - {adata.obs['dpt_pseudotime'].max():.3f}")
+# DBTITLE 1,UMAP batch visualization
+# Visualize batch correction results on UMAP
+if parameters['batch_correction'] == 'harmony' and parameters['batch_key'].strip() in adata.obs.columns:
+    sc.pl.umap(adata, color=parameters['batch_key'].strip(), size=2, save='umap_batch.png')
+
+# COMMAND ----------
+
+# DBTITLE 1,Cell Type Annotation header
+# MAGIC %md
+# MAGIC #### Cell Type Annotation (SCimilarity / CellTypist)
+
+# COMMAND ----------
+
+# DBTITLE 1,SCimilarity / CellTypist annotation
+# Cell type annotation — integrated from CellAtria/CellExpress pipeline
+import gc
+
+if parameters['annotation_method'] == 'scimilarity':
+    from scimilarity.utils import lognorm_counts, align_dataset
+    from scimilarity.cell_annotation import CellAnnotation
+
+    model_path = parameters['annotation_model'].strip()
+    if not model_path:
+        print("Warning: SCimilarity selected but no model path provided. Skipping.")
+        metrics['annotation_method'] = 'scimilarity_skipped'
+        metrics['n_celltypes_annotated'] = 0
+    else:
+        print(f"Running SCimilarity annotation with model: {model_path}")
+        gc.collect()  # Free memory before loading model
+
+        # Initialize annotation engine
+        ca = CellAnnotation(model_path=model_path)
+
+        # Align dataset genes to model's expected gene order
+        adata_aligned = align_dataset(adata, ca.gene_order)
+        n_aligned = adata_aligned.shape[1]
+        n_total = adata.shape[1]
+        print(f"Aligned {n_aligned}/{n_total} genes to SCimilarity model gene set")
+
+        # Get cell embeddings from pre-trained foundation model
+        embeddings = ca.get_embeddings(adata_aligned.X)
+        adata.obsm['X_scimilarity'] = embeddings
+
+        # Free aligned dataset before loading kNN index (~8.6 GB)
+        del adata_aligned
+        gc.collect()
+
+        # Annotate cell types via kNN search against ~23M cell reference atlas
+        print("Loading kNN index and predicting cell types...")
+        knn_result = ca.get_predictions_knn(embeddings)
+        
+        # Handle variable return signature across SCimilarity versions
+        if isinstance(knn_result, tuple):
+            print(f"  kNN returned {len(knn_result)} values")
+            predictions = knn_result[0]  # Cell type predictions are always first
+            # Try to extract distances (usually last element)
+            nn_dists = knn_result[-1] if len(knn_result) > 1 else None
+        else:
+            predictions = knn_result
+            nn_dists = None
+
+        adata.obs['celltype_annotation'] = predictions
+        if nn_dists is not None:
+            import numpy as np
+            if hasattr(nn_dists, 'mean'):
+                adata.obs['celltype_nn_dist'] = nn_dists.mean(axis=1) if nn_dists.ndim > 1 else nn_dists
+
+        # Free kNN objects to reclaim memory
+        del knn_result, embeddings
+        if hasattr(ca, 'reset_knn'):
+            ca.reset_knn()
+        del ca
+        gc.collect()
+
+        n_types = adata.obs['celltype_annotation'].nunique()
+        type_counts = adata.obs['celltype_annotation'].value_counts()
+        print(f"\nSCimilarity annotated {n_types} cell types:")
+        print(type_counts.head(15).to_string())
+
+        metrics['annotation_method'] = 'scimilarity'
+        metrics['n_celltypes_annotated'] = int(n_types)
+        metrics['annotation_genes_aligned'] = int(n_aligned)
+
+elif parameters['annotation_method'] == 'celltypist':
+    import celltypist
+    from celltypist import models as ct_models
+
+    model_name = parameters['annotation_model'].strip()
+    if not model_name:
+        model_name = 'Immune_All_Low.pkl'
+        print(f"No model specified, using default: {model_name}")
+
+    print(f"Running CellTypist annotation with model: {model_name}")
+    ct_models.download_models(model=model_name)
+    model = ct_models.Model.load(model=model_name)
+
+    predictions = celltypist.annotate(
+        adata,
+        model=model,
+        majority_voting=True,
+        over_clustering='cluster'
+    )
+    adata_annotated = predictions.to_adata()
+
+    adata.obs['celltype_annotation'] = adata_annotated.obs['predicted_labels']
+    adata.obs['celltype_majority_voting'] = adata_annotated.obs['majority_voting']
+    adata.obs['celltype_conf_score'] = adata_annotated.obs['conf_score']
+
+    del adata_annotated, predictions, model
+    gc.collect()
+
+    n_types = adata.obs['celltype_annotation'].nunique()
+    type_counts = adata.obs['celltype_annotation'].value_counts()
+    print(f"\nCellTypist annotated {n_types} cell types:")
+    print(type_counts.head(15).to_string())
+
+    metrics['annotation_method'] = 'celltypist'
+    metrics['n_celltypes_annotated'] = int(n_types)
+
 else:
-    print("Pseudotime computation skipped (compute_pseudotime=false)")
+    print("Cell type annotation: skipped (method=none)")
+    metrics['annotation_method'] = 'none'
+    metrics['n_celltypes_annotated'] = 0
+
+# COMMAND ----------
+
+# DBTITLE 1,UMAP annotation visualization
+# Visualize cell type annotations on UMAP
+if parameters['annotation_method'] != 'none' and 'celltype_annotation' in adata.obs.columns:
+    sc.pl.umap(
+        adata,
+        color='celltype_annotation',
+        size=2,
+        legend_loc='on data',
+        legend_fontsize=6,
+        save='umap_celltype_annotation.png'
+    )
+
+    # CellTypist majority voting view
+    if 'celltype_majority_voting' in adata.obs.columns:
+        sc.pl.umap(
+            adata,
+            color='celltype_majority_voting',
+            size=2,
+            legend_loc='on data',
+            legend_fontsize=6,
+            save='umap_celltype_majority_voting.png'
+        )
+
+    # Annotation quality: kNN distance (SCimilarity) or confidence score (CellTypist)
+    if 'celltype_nn_dist' in adata.obs.columns:
+        sc.pl.umap(adata, color='celltype_nn_dist', size=2, save='umap_annotation_distance.png')
+    elif 'celltype_conf_score' in adata.obs.columns:
+        sc.pl.umap(adata, color='celltype_conf_score', size=2, save='umap_annotation_confidence.png')
+
+    # Save annotation counts CSV for MLflow artifact
+    type_counts = adata.obs['celltype_annotation'].value_counts()
+    type_counts.to_csv(tmpdir.name + '/celltype_annotation_counts.csv')
+    print(f"Saved annotation counts ({len(type_counts)} types) to MLflow artifacts")
 
 # COMMAND ----------
 
@@ -399,6 +661,7 @@ pd.DataFrame({'marker_genes': marker_genes}).to_csv(
 # MAGIC ### Subsample the data to a maximum number of cells
 
 # COMMAND ----------
+
 import scipy
 import numpy as np
 
@@ -472,10 +735,6 @@ else:
 for i, gene in enumerate(marker_genes):
     df_flat[f"expr_{gene}"] = expression_matrix[:, i]
 
-# Add pseudotime if computed
-if 'dpt_pseudotime' in adata.obs.columns:
-    df_flat['dpt_pseudotime'] = adata.obs.loc[adata_markers.obs_names, 'dpt_pseudotime'].values
-
 # COMMAND ----------
 
 # MAGIC %md
@@ -490,8 +749,15 @@ if 'dpt_pseudotime' in adata.obs.columns:
 import mlflow
 mlflow.set_registry_uri("databricks-uc")
 
-# Set the MLflow experiment
-experiment = mlflow.set_experiment(parameters['mlflow_experiment'])
+# Set the MLflow experiment (use path-based name for Databricks)
+exp_name = parameters['mlflow_experiment']
+if not exp_name.startswith('/'):
+    # Convert simple name to path-based experiment under user's folder
+    user_email = parameters.get('user_email', 'default')
+    exp_name = f"/Users/{user_email}/{exp_name}"
+
+experiment = mlflow.set_experiment(exp_name)
+print(f"MLflow experiment: {experiment.name} (ID: {experiment.experiment_id})")
 
 # Tag the experiment for Genesis Workbench search
 mlflow.set_experiment_tags({
@@ -503,6 +769,12 @@ mlflow.set_experiment_tags({
 # save adata and our figures to disk
 # Drop Gene name column before saving (only needed during analysis, causes conflict with index)
 adata.var = adata.var.drop(columns=['Gene name'], errors='ignore')
+
+# Ensure all var columns are h5ad-compatible (convert NaN and non-string objects)
+for col in adata.var.columns:
+    if adata.var[col].dtype == object or str(adata.var[col].dtype) == 'category':
+        adata.var[col] = adata.var[col].fillna('').astype(str)
+
 adata.write_h5ad(tmpdir.name+"/adata_output.h5ad")
 # save the flat dataframe to disk
 df_flat.to_parquet(tmpdir.name + "/markers_flat.parquet")
@@ -514,11 +786,18 @@ metrics['total_time'] = total_time
 
 run_name = parameters['mlflow_run_name'] if parameters['mlflow_run_name'] else None
 
+# Separate numeric metrics from string metrics for MLflow
+numeric_metrics = {k: v for k, v in metrics.items() if isinstance(v, (int, float))}
+string_metrics = {k: str(v) for k, v in metrics.items() if not isinstance(v, (int, float))}
+
 # Log to MLflow with proper tags for Genesis Workbench
 with mlflow.start_run(run_name=run_name, experiment_id=experiment.experiment_id) as run:
     # Log metrics and params
-    mlflow.log_metrics(metrics)
+    mlflow.log_metrics(numeric_metrics)
     mlflow.log_params(parameters)
+    # Log string metrics as tags
+    for k, v in string_metrics.items():
+        mlflow.set_tag(f"metric_{k}", v)
     mlflow.log_artifacts(tmpdir.name)
     
     # Set required tags for Genesis Workbench search
@@ -526,5 +805,130 @@ with mlflow.start_run(run_name=run_name, experiment_id=experiment.experiment_id)
     mlflow.set_tag("created_by", parameters['user_email'])
     mlflow.set_tag("processing_mode", "scanpy")
 
+print(f"MLflow run logged: {run.info.run_id}")
+print(f"Experiment: {experiment.name}")
+print(f"Metrics: {numeric_metrics}")
+print(f"Total time: {total_time:.1f}s")
+
 # COMMAND ----------
+
+# DBTITLE 1,Log lineage to metadata tier
+# =============================================================================
+# Lineage Logging — Metadata Tier Integration
+# Records the scanpy analysis as a lineage edge: input h5ad → annotated h5ad (platinum)
+# =============================================================================
+
+try:
+    from genesis_workbench.lineage import LineageLogger
+
+    lineage = LineageLogger(
+        module="single_cell",
+        run_id=run.info.run_id,
+        user_email=parameters["user_email"],
+        run_source="mlflow",
+        catalog=parameters["catalog"] or "dhbl_discovery_us_dev",
+        schema=parameters["schema"] or "genesis_schema",
+    )
+
+    # ── Register input: source h5ad (gold — analysis-ready count matrix) ──
+    input_h5ad = lineage.register_asset(
+        path=parameters["data_path"],
+        asset_type="volume_file",
+        tier="gold",
+        format="h5ad",
+        display_name=f"Input h5ad ({parameters.get('mlflow_run_name', 'scanpy')})",
+        description=f"{int(metrics.get('total_cells_starting', 0))} cells before filtering",
+        tags={
+            "species": parameters["species"],
+            "n_cells_raw": str(int(metrics.get("total_cells_starting", 0))),
+        },
+    )
+
+    # ── Register output: annotated h5ad (platinum — scientist end result) ──
+    output_h5ad = lineage.register_asset(
+        path=f"mlflow-artifacts://runs/{run.info.run_id}/adata_output.h5ad",
+        asset_type="mlflow_artifact",
+        tier="platinum",
+        format="h5ad",
+        display_name=f"Annotated h5ad ({parameters.get('mlflow_run_name', 'scanpy')})",
+        description=(
+            f"{adata.n_obs} cells, {adata.n_vars} genes, "
+            f"{int(metrics.get('n_clusters', 0))} clusters, "
+            f"{parameters.get('annotation_method', 'none')} annotation"
+        ),
+        row_count=adata.n_obs,
+        tags={
+            "species": parameters["species"],
+            "n_cells": str(adata.n_obs),
+            "n_genes": str(adata.n_vars),
+            "n_clusters": str(int(metrics.get("n_clusters", 0))),
+            "doublet_method": parameters.get("doublet_method", "none"),
+            "batch_correction": parameters.get("batch_correction", "none"),
+            "clustering_method": parameters.get("clustering_method", "leiden"),
+            "annotation_method": parameters.get("annotation_method", "none"),
+            "annotation_model": parameters.get("annotation_model", ""),
+        },
+    )
+
+    # ── Register output: markers parquet (platinum) ──
+    markers_asset = lineage.register_asset(
+        path=f"mlflow-artifacts://runs/{run.info.run_id}/markers_flat.parquet",
+        asset_type="mlflow_artifact",
+        tier="platinum",
+        format="parquet",
+        display_name=f"Marker Gene Matrix ({parameters.get('mlflow_run_name', 'scanpy')})",
+        description=f"Flat dataframe with cluster assignments + marker gene expression",
+        tags={"n_marker_genes": str(len(marker_genes)) if 'marker_genes' in dir() else "0"},
+    )
+
+    # ── Record lineage edges ──
+    lineage.link(
+        source=input_h5ad,
+        target=output_h5ad,
+        relationship="consumed_by",
+        step="scanpy_pipeline",
+    )
+    lineage.link(
+        source=input_h5ad,
+        target=markers_asset,
+        relationship="consumed_by",
+        step="marker_gene_extraction",
+    )
+
+    # ── Register the run ──
+    lineage.register_run(
+        run_name=parameters.get("mlflow_run_name", "scanpy_analysis"),
+        experiment_name=parameters.get("mlflow_experiment", ""),
+        status="completed",
+        parameters={
+            k: str(v) for k, v in parameters.items()
+            if k not in ("data_path",)  # exclude long paths from params map
+        },
+        metrics={
+            k: float(v) for k, v in numeric_metrics.items()
+        },
+        start_time=None,  # Could add t0 if converted to datetime
+        end_time=None,
+        tags={
+            "doublet_method": parameters.get("doublet_method", "none"),
+            "batch_correction": parameters.get("batch_correction", "none"),
+            "annotation_method": parameters.get("annotation_method", "none"),
+            "species": parameters["species"],
+        },
+    )
+
+    # ── Flush to Delta ──
+    result = lineage.flush()
+    print(f"\n\U0001f4cb Lineage logged: {result['assets_written']} assets, "
+          f"{result['edges_written']} edges, {result['run_written']} run")
+
+except ImportError:
+    print("\u26a0\ufe0f  genesis_workbench.lineage not available — skipping lineage logging")
+    print("   Install wheel v0.1.3+ to enable metadata tier integration")
+except Exception as e:
+    # Non-fatal: lineage logging should never break the analysis
+    print(f"\u26a0\ufe0f  Lineage logging failed (non-fatal): {e}")
+
+# COMMAND ----------
+
 
